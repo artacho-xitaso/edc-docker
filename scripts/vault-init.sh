@@ -24,13 +24,8 @@ set -eu
 VAULT_ADDR="${VAULT_ADDR:-http://vault:8200}"
 STATE_DIR="/vault/state"
 INIT_FILE="${STATE_DIR}/init.json"
-EDC_ENV_FILE="${STATE_DIR}/edc-vault.env"
-EDC_TOKEN_PERIOD="${EDC_TOKEN_PERIOD:-720h}"
 
 export VAULT_ADDR
-
-mkdir -p "${STATE_DIR}"
-chmod 700 "${STATE_DIR}"
 
 # jq is not in the vanilla hashicorp/vault image — install it on first run.
 # apk caches between container recreations within the same volume layer, and
@@ -127,30 +122,6 @@ if [ -n "${TOKEN_SIGNER_KEY_JWK:-}" ]; then
     vault kv put secret/token-signer-key content="${TOKEN_SIGNER_KEY_JWK}" > /dev/null
 else
     echo "WARNING: TOKEN_SIGNER_KEY_JWK is empty in environment, skipping" >&2
-fi
-
-# Mint or rotate the EDC token.
-need_new_token=1
-if [ -f "${EDC_ENV_FILE}" ]; then
-    CURRENT_TOKEN="$(sed -n 's/^EDC_VAULT_HASHICORP_TOKEN=//p' "${EDC_ENV_FILE}")"
-    if [ -n "${CURRENT_TOKEN}" ] && \
-       VAULT_TOKEN="${CURRENT_TOKEN}" vault token lookup >/dev/null 2>&1; then
-        need_new_token=0
-    fi
-fi
-
-if [ "${need_new_token}" -eq 1 ]; then
-    echo "=== Minting EDC token (period=${EDC_TOKEN_PERIOD}) ==="
-    NEW_TOKEN="$(vault token create \
-        -policy=edc \
-        -period="${EDC_TOKEN_PERIOD}" \
-        -display-name=edc \
-        -format=json | jq -r .auth.client_token)"
-    umask 077
-    printf 'EDC_VAULT_HASHICORP_TOKEN=%s\n' "${NEW_TOKEN}" > "${EDC_ENV_FILE}"
-    chmod 600 "${EDC_ENV_FILE}"
-else
-    echo "=== Existing EDC token is still valid, keeping it ==="
 fi
 
 echo "=== Vault is ready ==="

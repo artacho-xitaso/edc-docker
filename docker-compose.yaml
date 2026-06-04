@@ -122,11 +122,9 @@ services:
             VAULT_ADDR: "http://vault:8200"
             STS_CLIENT_SECRET: "${STS_CLIENT_SECRET}"
             TOKEN_SIGNER_KEY_JWK: "${TOKEN_SIGNER_KEY_JWK}"
-            EDC_TOKEN_PERIOD: "${EDC_TOKEN_PERIOD:-720h}"
         volumes:
             - vault-state:/vault/state
             - ./scripts/vault-init.sh:/usr/local/bin/vault-init.sh:ro
-            - ./runtime:/host-runtime
         entrypoint: ["/bin/sh", "-c"]
         # After the bulk of the work is done by vault-init.sh, copy the produced
         # env file into the bind-mounted ./runtime so that EDC services can pick
@@ -135,8 +133,6 @@ services:
             - |
                 set -eu
                 /bin/sh /usr/local/bin/vault-init.sh
-                cp /vault/state/edc-vault.env /host-runtime/edc-vault.env
-                chmod 644 /host-runtime/edc-vault.env
         depends_on:
             vault:
                 condition: service_healthy
