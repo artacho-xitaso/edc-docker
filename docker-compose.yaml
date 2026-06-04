@@ -177,11 +177,11 @@ services:
             # HTTP 403 "Invalid query: requested Credentials outside of
             # scope." See docs/ONBOARDING.md §Scopes.
             - ./config/edc-config.properties:/app/configuration.properties:ro
-        env_file:
-            - path: ./runtime/edc-vault.env
-              required: false
         environment:
             <<: *java-env
+
+            # --- Vault token (injected directly; avoids env_file timing issue on cold start) ---
+            EDC_VAULT_HASHICORP_TOKEN: "${EDC_VAULT_HASHICORP_TOKEN}"
 
             # --- File-backed config (hyphenated keys) ---
             EDC_FS_CONFIG: "/app/configuration.properties"
@@ -267,11 +267,11 @@ services:
     dataplane:
         image: tractusx/edc-dataplane-hashicorp-vault:${EDC_VERSION}
         restart: unless-stopped
-        env_file:
-            - path: ./runtime/edc-vault.env
-              required: false
         environment:
             <<: *java-env
+
+            # --- Vault token (injected directly; avoids env_file timing issue on cold start) ---
+            EDC_VAULT_HASHICORP_TOKEN: "${EDC_VAULT_HASHICORP_TOKEN}"
 
             EDC_HOSTNAME: "${EDC_HOSTNAME:-controlplane}"
             EDC_PARTICIPANT_ID: "${EDC_BPN}"
