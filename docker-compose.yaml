@@ -39,6 +39,9 @@ x-java-env: &java-env
 
 services:
     # --- HTTPS termination ---------------------------------------------------
+    # Caddyfile is written inline to avoid a bind-mount that would fail in
+    # Portainer git-stack deployments. {$VAR} is Caddy's env-var syntax and
+    # is NOT expanded by the shell (heredoc uses quoted 'EOF' delimiter).
     caddy:
         image: caddy:2.11.2-alpine
         restart: unless-stopped
@@ -46,12 +49,38 @@ services:
             - "80:80"
             - "443:443"
         volumes:
-            - ./config/Caddyfile:/etc/caddy/Caddyfile:ro
             - caddy-data:/data
             - caddy-config:/config
         environment:
             EDC_PUBLIC_HOST: ${EDC_PUBLIC_HOST}
             ACME_EMAIL: ${ACME_EMAIL}
+        entrypoint: ["/bin/sh", "-c"]
+        command:
+            - |
+                cat > /tmp/Caddyfile << 'EOF'
+                {
+                    email {$ACME_EMAIL}
+                }
+                {$EDC_PUBLIC_HOST} {
+                    encode gzip
+                    @dsp path /api/v1/dsp /api/v1/dsp/*
+                    handle @dsp {
+                        reverse_proxy controlplane:8084
+                    }
+                    @public path /api/public /api/public/*
+                    handle @public {
+                        reverse_proxy dataplane:8081
+                    }
+                    handle {
+                        respond "not found" 404
+                    }
+                    log {
+                        output stdout
+                        format console
+                    }
+                }
+                EOF
+                exec caddy run --config /tmp/Caddyfile --adapter caddyfile
         depends_on:
             controlplane:
                 condition: service_healthy
@@ -132,11 +161,11 @@ services:
                 condition: service_completed_successfully
 
     # --- Vault init / unseal / seed (runs to completion on every up) ---------
+    # Script is inlined to avoid a bind-mount that would fail in Portainer
+    # git-stack deployments. Idempotent: safe to re-run on every compose up.
     vault-init:
         image: hashicorp/vault:1.21.4
         restart: "no"
-        # Root is required to install jq via apk on first run and to write the
-        # bind-mounted runtime/edc-vault.env. Vault itself never runs as root.
         user: "0"
         environment:
             VAULT_ADDR: "http://vault:8200"
@@ -144,36 +173,120 @@ services:
             TOKEN_SIGNER_KEY_JWK: "${TOKEN_SIGNER_KEY_JWK}"
         volumes:
             - vault-state:/vault/state
-            - ./scripts/vault-init.sh:/usr/local/bin/vault-init.sh:ro
         entrypoint: ["/bin/sh", "-c"]
-        # After the bulk of the work is done by vault-init.sh, copy the produced
-        # env file into the bind-mounted ./runtime so that EDC services can pick
-        # it up via env_file on the next compose call.
         command:
             - |
                 set -eu
-                /bin/sh /usr/local/bin/vault-init.sh
+                VAULT_ADDR="${VAULT_ADDR:-http://vault:8200}"
+                STATE_DIR="/vault/state"
+                INIT_FILE="${STATE_DIR}/init.json"
+                export VAULT_ADDR
+
+                mkdir -p "${STATE_DIR}"
+                chmod 700 "${STATE_DIR}"
+
+                command -v jq >/dev/null 2>&1 || apk add --no-cache jq >/dev/null
+
+                wait_for_vault() {
+                    i=0
+                    while ! wget -qO- "${VAULT_ADDR}/v1/sys/health?standbyok=true&sealedcode=200&uninitcode=200" >/dev/null 2>&1; do
+                        i=$((i+1))
+                        [ "${i}" -gt 60 ] && { echo "vault did not become reachable in 60s" >&2; exit 1; }
+                        sleep 1
+                    done
+                }
+                wait_for_vault
+
+                INITIALIZED="$(vault status -format=json 2>/dev/null | jq -r .initialized)"
+                if [ "${INITIALIZED}" != "true" ]; then
+                    echo "=== Initialising vault (first boot) ==="
+                    vault operator init -key-shares=5 -key-threshold=3 -format=json > "${INIT_FILE}"
+                    chmod 600 "${INIT_FILE}"
+                    echo "=== ACTION REQUIRED: back up /vault/state/init.json off-host ==="
+                fi
+
+                SEALED="$(vault status -format=json 2>/dev/null | jq -r .sealed)"
+                if [ "${SEALED}" = "true" ]; then
+                    [ ! -f "${INIT_FILE}" ] && { echo "vault sealed but ${INIT_FILE} missing" >&2; exit 1; }
+                    echo "=== Unsealing vault ==="
+                    for i in 0 1 2; do
+                        vault operator unseal "$(jq -r ".unseal_keys_b64[${i}]" "${INIT_FILE}")" > /dev/null
+                    done
+                fi
+
+                ROOT_TOKEN="$(jq -r .root_token "${INIT_FILE}")"
+                export VAULT_TOKEN="${ROOT_TOKEN}"
+
+                vault secrets list -format=json 2>/dev/null | jq -e '."secret/"' > /dev/null || \
+                    vault secrets enable -path=secret -version=2 kv > /dev/null
+
+                echo "=== Writing edc policy ==="
+                vault policy write edc - <<'POLICY' > /dev/null
+                path "secret/data/sts-oauth-client-secret" { capabilities = ["read"] }
+                path "secret/data/token-signer-key"        { capabilities = ["read"] }
+                path "auth/token/renew-self"               { capabilities = ["update"] }
+                path "auth/token/lookup-self"              { capabilities = ["read"] }
+                POLICY
+
+                [ -n "${STS_CLIENT_SECRET:-}" ] && \
+                    vault kv put secret/sts-oauth-client-secret content="${STS_CLIENT_SECRET}" > /dev/null || \
+                    echo "WARNING: STS_CLIENT_SECRET empty, skipping" >&2
+
+                [ -n "${TOKEN_SIGNER_KEY_JWK:-}" ] && \
+                    vault kv put secret/token-signer-key content="${TOKEN_SIGNER_KEY_JWK}" > /dev/null || \
+                    echo "WARNING: TOKEN_SIGNER_KEY_JWK empty, skipping" >&2
+
+                echo "=== Vault is ready ==="
         depends_on:
             vault:
                 condition: service_healthy
 
     # --- Vault auto-unseal sidecar (self-heal across restarts) ---------------
-    # vault-init unseals on `docker compose up`, but a host reboot restarts the
-    # EDC via Docker's restart policy WITHOUT re-running the one-shot vault-init,
-    # leaving Vault sealed (→ EDC DSP 401 / health 503). This long-running
-    # sidecar re-unseals from the persisted init.json whenever Vault is sealed,
-    # so the stack self-heals across restarts.
+    # Script is inlined to avoid a bind-mount that would fail in Portainer
+    # git-stack deployments.
     vault-unseal:
         image: hashicorp/vault:1.21.4
         restart: unless-stopped
-        # init.json is written root:root mode 600 by vault-init; read it as root.
         user: "0"
         environment:
             VAULT_ADDR: "http://vault:8200"
         volumes:
             - vault-state:/vault/state:ro
-            - ./scripts/auto-unseal.sh:/usr/local/bin/auto-unseal.sh:ro
-        entrypoint: ["/bin/sh", "/usr/local/bin/auto-unseal.sh"]
+        entrypoint: ["/bin/sh", "-c"]
+        command:
+            - |
+                set -u
+                VAULT_ADDR="${VAULT_ADDR:-http://vault:8200}"
+                export VAULT_ADDR
+                INIT_FILE="/vault/state/init.json"
+                INTERVAL="${UNSEAL_INTERVAL:-15}"
+
+                command -v jq >/dev/null 2>&1 || apk add --no-cache jq >/dev/null 2>&1 || true
+
+                is_sealed() {
+                    vault status 2>/dev/null | grep -q '^Sealed[[:space:]]*true'
+                }
+
+                echo "[auto-unseal] watcher started (interval=${INTERVAL}s)"
+                while true; do
+                    if [ -f "${INIT_FILE}" ] && is_sealed; then
+                        echo "[auto-unseal] Vault is sealed — unsealing"
+                        command -v jq >/dev/null 2>&1 || apk add --no-cache jq >/dev/null 2>&1 || true
+                        i=0
+                        while [ "${i}" -lt 3 ]; do
+                            key="$(jq -r ".unseal_keys_b64[${i}]" "${INIT_FILE}" 2>/dev/null)"
+                            [ -n "${key}" ] && [ "${key}" != "null" ] && \
+                                vault operator unseal "${key}" >/dev/null 2>&1
+                            i=$((i + 1))
+                        done
+                        if is_sealed; then
+                            echo "[auto-unseal] STILL sealed after 3 keys — check init.json"
+                        else
+                            echo "[auto-unseal] Vault unsealed"
+                        fi
+                    fi
+                    sleep "${INTERVAL}"
+                done
         depends_on:
             vault:
                 condition: service_healthy
