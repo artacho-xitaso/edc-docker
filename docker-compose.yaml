@@ -88,13 +88,33 @@ services:
             - vault-data:/vault/data
 
     # --- HashiCorp Vault (production raft) -----------------------------------
+    # Config is written inline via the entrypoint to avoid a bind-mount of
+    # vault.hcl, which fails in Portainer git-stack deployments (Portainer
+    # resolves relative paths inside its own container, not on the Docker host).
     vault:
         image: hashicorp/vault:1.21.4
         restart: unless-stopped
         cap_add: [IPC_LOCK]
-        command: ["vault", "server", "-config=/vault/config/config.hcl"]
+        entrypoint: ["/bin/sh", "-c"]
+        command:
+            - |
+                mkdir -p /vault/config
+                cat > /vault/config/config.hcl << 'EOF'
+                storage "raft" {
+                    path    = "/vault/data"
+                    node_id = "node1"
+                }
+                listener "tcp" {
+                    address     = "0.0.0.0:8200"
+                    tls_disable = "true"
+                }
+                api_addr     = "http://vault:8200"
+                cluster_addr = "http://vault:8201"
+                ui            = false
+                disable_mlock = false
+                EOF
+                exec vault server -config=/vault/config/config.hcl
         volumes:
-            - ./config/vault.hcl:/vault/config/config.hcl:ro
             - vault-data:/vault/data
         environment:
             VAULT_ADDR: "http://127.0.0.1:8200"
